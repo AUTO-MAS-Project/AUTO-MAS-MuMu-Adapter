@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "auto-mas-mumu-adapter"
+version = "0.1.0"
+description = "MuMu emulator adapter"
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.12,<3.13"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "AUTO-MAS Team" }]
+keywords = ["auto-mas-plugin", "auto-mas-id:mumu_adapter"]
+dependencies = ["auto-mas-core>=5.9.0b1,<6"]
+
+[project.urls]
+Homepage = "https://github.com/AUTO-MAS-Project/AUTO-MAS-MuMu-Adapter"
+Repository = "https://github.com/AUTO-MAS-Project/AUTO-MAS-MuMu-Adapter"
+Documentation = "https://github.com/AUTO-MAS-Project/AUTO-MAS-MuMu-Adapter/blob/master/README.md"
+Issues = "https://github.com/AUTO-MAS-Project/AUTO-MAS-MuMu-Adapter/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+mumu_adapter = ["py.typed", "i18n/*.json"]
