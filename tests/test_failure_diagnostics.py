@@ -175,3 +175,27 @@ def test_diagnostics_probe_failure_preserves_command_error(tmp_path, monkeypatch
     monkeypatch.setattr(ProcessRunner, "run_process", run_process)
     with pytest.raises(RuntimeError, match="errcode=-12"):
         asyncio.run(backend._run("setting", "-v", "1", "-aw"))
+
+
+def test_timeout_during_version_probe_preserves_known_failure(tmp_path, monkeypatch):
+    backend = make_backend(tmp_path)
+
+    async def check():
+        entered_version_probe = asyncio.Event()
+
+        async def run_process(program, *args, **kwargs):
+            if args[0] == "version":
+                entered_version_probe.set()
+                await asyncio.Event().wait()
+            return ProcessResult('{"errcode":-12}', "", 4294967284)
+
+        monkeypatch.setattr(ProcessRunner, "run_process", run_process)
+        pending = asyncio.create_task(backend._run("setting", "-v", "1", "-aw"))
+        await entered_version_probe.wait()
+        await asyncio.wait_for(pending, timeout=0)
+
+    with pytest.raises(TimeoutError) as error:
+        asyncio.run(check())
+    cause = str(error.value.__cause__)
+    assert "stage=read-settings" in cause
+    assert "errcode=-12" in cause

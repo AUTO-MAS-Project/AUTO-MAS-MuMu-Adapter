@@ -131,14 +131,19 @@ class MumuManager(DeviceBase):
         self.shutdown_reports: dict[str, ShutdownReport] = {}
         self._probe_failures: dict[str, str] = {}
 
-    async def _version_for_diagnostics(self) -> str:
+    async def _version_for_diagnostics(self, pending_failure: str) -> str:
         """失败后探测 CLI 版本，后续复用结果。"""
         if self._cli_version is None:
             try:
                 result = await ProcessRunner.run_process(
                     self.emulator_path, "version", timeout=1, if_merge_std=True
                 )
-            except (OSError, RuntimeError):
+            except asyncio.CancelledError as error:
+                if not error.args:
+                    error.args = (pending_failure,)
+                raise
+            except Exception:
+                # 可选探测也会经过宿主的分身进程，失败不能盖掉原命令的结果。
                 self._cli_version = "unknown"
             else:
                 match = re.search(
@@ -196,21 +201,24 @@ class MumuManager(DeviceBase):
         if result.returncode == 0:
             return result
         elapsed = time.monotonic() - started_at
+        code = mumu_error_code(result.stdout)
+        failure = (
+            f"returncode={result.returncode}, errcode={code}, "
+            f"output={'present' if result.stdout.strip() else 'empty'}{context}"
+        )
         version = self._cli_version or "unknown"
         if stage != "read-info":
-            version = await self._version_for_diagnostics()
+            version = await self._version_for_diagnostics(
+                f"MuMu 命令执行失败（stage={stage}, {failure}）"
+            )
         detail = operation_detail(stage, version, elapsed, timeout)
-        code = mumu_error_code(result.stdout)
         hint = (
             _low_integrity_hint(self.emulator_path, result.stdout)
             if stage == "launch"
             else ""
         )
         logger.debug(f"MuMu CLI {stage}: {result.failure_detail()}")
-        raise MuMuCommandError(
-            f"MuMu 命令执行失败（{detail}, returncode={result.returncode}, "
-            f"errcode={code}, output={'present' if result.stdout.strip() else 'empty'}{context}）{hint}"
-        )
+        raise MuMuCommandError(f"MuMu 命令执行失败（{detail}, {failure}）{hint}")
 
     async def _state_failure(
         self,
@@ -221,12 +229,13 @@ class MumuManager(DeviceBase):
         diagnosis: str = "",
     ) -> MuMuCommandError:
         elapsed = time.monotonic() - started_at
-        version = await self._version_for_diagnostics()
-        detail = operation_detail(stage, version, elapsed, self.config.Info.MaxWaitTime)
         probe = self._probe_failures.get(idx, "ok")
-        return MuMuCommandError(
-            f"MuMu 状态检查失败（{detail}, status={status.name}, probe={probe}）{diagnosis}"
+        failure = f"status={status.name}, probe={probe}"
+        version = await self._version_for_diagnostics(
+            f"MuMu 状态检查失败（stage={stage}, {failure}）"
         )
+        detail = operation_detail(stage, version, elapsed, self.config.Info.MaxWaitTime)
+        return MuMuCommandError(f"MuMu 状态检查失败（{detail}, {failure}）{diagnosis}")
 
     def get_adb_path(self) -> Path | None:
         adb_path = self.emulator_path.parent / "adb.exe"
