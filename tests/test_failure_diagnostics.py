@@ -99,3 +99,79 @@ def test_app_failure_summary_keeps_adb_address_local():
     assert adb_address in result.detail
     assert "adb=connection-lost" in result.diagnostics
     assert adb_address not in result.diagnostics
+
+
+def test_optional_window_hide_during_boot_preserves_probe_fallback(
+    tmp_path, monkeypatch
+):
+    backend = make_backend(tmp_path)
+
+    async def run_process(program, *args, **kwargs):
+        assert args == ("info", "-v", "1")
+        return ProcessResult("invalid JSON", "", 0)
+
+    monkeypatch.setattr(ProcessRunner, "run_process", run_process)
+    assert (
+        asyncio.run(backend.setVisible("1", False, require_known_status=False))
+        == DeviceStatus.UNKNOWN
+    )
+
+
+def test_outer_timeout_preserves_interrupt_stage(tmp_path, monkeypatch):
+    backend = make_backend(tmp_path)
+
+    async def run_process(program, *args, **kwargs):
+        assert args == ("info", "-v", "1")
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(ProcessRunner, "run_process", run_process)
+
+    async def close():
+        await asyncio.wait_for(backend.close("1"), timeout=0.03)
+
+    with pytest.raises(TimeoutError) as error:
+        asyncio.run(close())
+    assert isinstance(error.value.__cause__, asyncio.CancelledError)
+    assert "stage=read-info" in str(error.value.__cause__)
+
+
+def test_app_install_error_summary_uses_known_codes():
+    assert (
+        applaunch.adb_output_kind(
+            1,
+            "adb: failed to install C:/private.apk: Failure [INSTALL_FAILED_VERSION_DOWNGRADE]",
+        )
+        == "INSTALL_FAILED_VERSION_DOWNGRADE"
+    )
+    assert (
+        applaunch.adb_output_kind(
+            1, "adb: failed to install C:/INSTALL_FAILED_PRIVATE.apk"
+        )
+        == "adb-error"
+    )
+
+
+def test_android_not_ready_is_distinct_from_adb_failure():
+    async def booting(*args, **kwargs):
+        return 0, "0"
+
+    result = asyncio.run(
+        applaunch.ensure_app_running(
+            booting, "com.example.game", boot_timeout=0, launch_timeout=0
+        )
+    )
+    assert result.reason == "boot-timeout"
+    assert "adb=android-not-ready, returncode=0" in result.diagnostics
+
+
+def test_diagnostics_probe_failure_preserves_command_error(tmp_path, monkeypatch):
+    backend = make_backend(tmp_path)
+
+    async def run_process(program, *args, **kwargs):
+        if args[0] == "version":
+            raise RuntimeError("desktop process unavailable")
+        return ProcessResult('{"errcode":-12}', "", 4294967284)
+
+    monkeypatch.setattr(ProcessRunner, "run_process", run_process)
+    with pytest.raises(RuntimeError, match="errcode=-12"):
+        asyncio.run(backend._run("setting", "-v", "1", "-aw"))

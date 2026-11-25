@@ -96,7 +96,7 @@ def _low_integrity_hint(emulator_path: Path, stdout: str) -> str:
     # MuMuManager.exe 在 nx_main/shell 这类一层子目录里，再上一层就是安装根
     install_root = emulator_path.parent.parent
     target = install_root if install_root.is_dir() else emulator_path.parent
-    logger.debug(
+    logger.info(
         MUMU_LOW_INTEGRITY_HINT.format(root=target, errcode=MUMU_MAINNX_ERRCODE)
     )
     return "。MuMu 安装目录带有低完整性标签，请查看本地日志中的修复命令。"
@@ -138,7 +138,7 @@ class MumuManager(DeviceBase):
                 result = await ProcessRunner.run_process(
                     self.emulator_path, "version", timeout=1, if_merge_std=True
                 )
-            except (OSError, TimeoutError):
+            except (OSError, RuntimeError):
                 self._cli_version = "unknown"
             else:
                 match = re.search(
@@ -163,6 +163,17 @@ class MumuManager(DeviceBase):
                 if_merge_std=True,
                 breakaway=breakaway,
             )
+        except asyncio.CancelledError as error:
+            # 宿主 wait_for 超时会把这次取消作为 TimeoutError 的原因。
+            if not error.args:
+                detail = operation_detail(
+                    stage,
+                    self._cli_version or "unknown",
+                    time.monotonic() - started_at,
+                    timeout,
+                )
+                error.args = (f"MuMu 命令中断（{detail}{context}）",)
+            raise
         except TimeoutError:
             detail = operation_detail(
                 stage,
@@ -625,7 +636,7 @@ class MumuManager(DeviceBase):
                 self.runtime_policy.silence_enabled()
                 and status == DeviceStatus.STARTING
             ):
-                await self.setVisible(idx, False)
+                await self.setVisible(idx, False, require_known_status=False)
             elif status == DeviceStatus.ONLINE:
                 logger.info(
                     f"模拟器已在线: {idx} - {package_name} - 用时: "
@@ -1094,11 +1105,16 @@ class MumuManager(DeviceBase):
             for value in self._extract_device_entries(data_json)
         }
 
-    async def setVisible(self, idx: str, is_visible: bool) -> DeviceStatus:
+    async def setVisible(
+        self, idx: str, is_visible: bool, *, require_known_status: bool = True
+    ) -> DeviceStatus:
         started_at = time.monotonic()
         stage = "show-window" if is_visible else "hide-window"
         status = await self.getStatus(idx)
-        if status in (DeviceStatus.ERROR, DeviceStatus.UNKNOWN):
+        if (
+            status in (DeviceStatus.ERROR, DeviceStatus.UNKNOWN)
+            and require_known_status
+        ):
             raise await self._state_failure(idx, stage, status, started_at)
         if status not in (DeviceStatus.STARTING, DeviceStatus.ONLINE):
             logger.info(f"MuMu 窗口操作跳过（stage={stage}, status={status.name}）")
@@ -1113,7 +1129,13 @@ class MumuManager(DeviceBase):
             breakaway=True,
         )
 
-        return await self.getStatus(idx)
+        status = await self.getStatus(idx)
+        if (
+            status in (DeviceStatus.ERROR, DeviceStatus.UNKNOWN)
+            and require_known_status
+        ):
+            raise await self._state_failure(idx, f"{stage}-verify", status, started_at)
+        return status
 
     async def get_device_info(self, idx: str) -> str:
         result = await self._run_cli("read-info", "info", "-v", idx, breakaway=True)
