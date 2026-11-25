@@ -8,7 +8,6 @@ import json
 import os
 import tempfile
 import time
-from contextlib import suppress
 from contextvars import Context
 from dataclasses import asdict
 from pathlib import Path
@@ -531,8 +530,7 @@ class Control(EmulatorControl[MuMuGame, MuMuDevice]):
     async def teardown(self):
         if self._version_probe is not None:
             self._version_probe.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._version_probe
+            await asyncio.gather(self._version_probe, return_exceptions=True)
         if self._backend is not None:
             tasks = [
                 r.task
