@@ -38,6 +38,7 @@ def test_settings_failure_reports_codes_without_payload(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(ProcessRunner, "run_process", run_process)
+    asyncio.run(backend.probe_cli_version())
     for _ in range(2):
         with pytest.raises(RuntimeError) as error:
             asyncio.run(backend._run("setting", "-v", "1", "-aw"))
@@ -48,7 +49,7 @@ def test_settings_failure_reports_codes_without_payload(tmp_path, monkeypatch):
         assert "errcode=-12" in detail
         assert private not in detail
         assert "D:/Private" not in detail
-    assert commands == ["setting", "version", "setting"]
+    assert commands == ["version", "setting", "setting"]
 
 
 @pytest.mark.parametrize("operation", ("close", "show"))
@@ -68,7 +69,7 @@ def test_failed_status_probe_is_not_reported_as_success(
     call = backend.close("1") if operation == "close" else backend.setVisible("1", True)
     with pytest.raises(RuntimeError, match=r"status=UNKNOWN, probe=invalid-json"):
         asyncio.run(call)
-    assert commands == ["info", "version"]
+    assert commands == ["info"]
 
 
 def test_close_already_offline_stays_noop(tmp_path, monkeypatch):
@@ -173,29 +174,55 @@ def test_diagnostics_probe_failure_preserves_command_error(tmp_path, monkeypatch
         return ProcessResult('{"errcode":-12}', "", 4294967284)
 
     monkeypatch.setattr(ProcessRunner, "run_process", run_process)
+    asyncio.run(backend.probe_cli_version())
     with pytest.raises(RuntimeError, match="errcode=-12"):
         asyncio.run(backend._run("setting", "-v", "1", "-aw"))
 
 
-def test_timeout_during_version_probe_preserves_known_failure(tmp_path, monkeypatch):
+def test_known_cli_error_does_not_wait_for_diagnostics(tmp_path, monkeypatch):
     backend = make_backend(tmp_path)
 
     async def check():
-        entered_version_probe = asyncio.Event()
+        pending_probe = asyncio.Event()
 
         async def run_process(program, *args, **kwargs):
             if args[0] == "version":
-                entered_version_probe.set()
+                pending_probe.set()
                 await asyncio.Event().wait()
             return ProcessResult('{"errcode":-12}', "", 4294967284)
 
         monkeypatch.setattr(ProcessRunner, "run_process", run_process)
-        pending = asyncio.create_task(backend._run("setting", "-v", "1", "-aw"))
-        await asyncio.wait_for(entered_version_probe.wait(), timeout=2)
-        await asyncio.wait_for(pending, timeout=0)
+        probe = asyncio.create_task(backend.probe_cli_version())
+        try:
+            await asyncio.wait_for(pending_probe.wait(), timeout=2)
+            with pytest.raises(RuntimeError, match=r"mumu=unknown.*errcode=-12"):
+                await asyncio.wait_for(
+                    backend._run("setting", "-v", "1", "-aw"), timeout=1
+                )
+        finally:
+            probe.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await probe
 
-    with pytest.raises(TimeoutError) as error:
-        asyncio.run(check())
-    cause = str(error.value.__cause__)
-    assert "stage=read-settings" in cause
-    assert "errcode=-12" in cause
+    asyncio.run(check())
+
+
+def test_transient_desktop_transport_failure_allows_next_status_probe(
+    tmp_path, monkeypatch
+):
+    backend = make_backend(tmp_path)
+    attempts = 0
+
+    async def run_process(program, *args, **kwargs):
+        nonlocal attempts
+        assert args == ("info", "-v", "1")
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("desktop worker did not start process")
+        return ProcessResult(
+            '{"index":"1","name":"test","is_process_started":false}', "", 0
+        )
+
+    monkeypatch.setattr(ProcessRunner, "run_process", run_process)
+    assert asyncio.run(backend.getStatus("1")) == DeviceStatus.ERROR
+    assert asyncio.run(backend.getStatus("1")) == DeviceStatus.OFFLINE

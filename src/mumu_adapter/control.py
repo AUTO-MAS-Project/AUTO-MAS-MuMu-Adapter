@@ -8,6 +8,8 @@ import json
 import os
 import tempfile
 import time
+from contextlib import suppress
+from contextvars import Context
 from dataclasses import asdict
 from pathlib import Path
 from typing import BinaryIO, Literal
@@ -74,6 +76,7 @@ class Control(EmulatorControl[MuMuGame, MuMuDevice]):
     def __init__(self, config: MuMuGame | None = None) -> None:
         super().__init__(config=config)
         self._backend: MuMu6Manager | None = None
+        self._version_probe: asyncio.Task[None] | None = None
         self._operation = asyncio.Lock()
         self._resources: dict[UUID, BinaryIO] = {}
 
@@ -106,6 +109,10 @@ class Control(EmulatorControl[MuMuGame, MuMuDevice]):
                     block_ads_enabled=lambda: self.runtime.block_ad,
                     resource_path=self.runtime.resource_path,
                 )
+            )
+            # 版本探测在宿主本地运行，不占用调用方的分身进程或任务时限。
+            self._version_probe = asyncio.create_task(
+                self._backend.probe_cli_version(), context=Context()
             )
         return self._backend
 
@@ -522,6 +529,10 @@ class Control(EmulatorControl[MuMuGame, MuMuDevice]):
         await self.sweep_backups()
 
     async def teardown(self):
+        if self._version_probe is not None:
+            self._version_probe.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._version_probe
         if self._backend is not None:
             tasks = [
                 r.task

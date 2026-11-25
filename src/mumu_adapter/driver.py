@@ -127,33 +127,30 @@ class MumuManager(DeviceBase):
 
         # {实例索引: 静音记录}，启动时跟随静音、关闭前还原
         self._audio_mute_states: dict[str, tools.AudioMuteRecord] = {}
-        self._cli_version: str | None = None
+        self._cli_version = "unknown"
         self.shutdown_reports: dict[str, ShutdownReport] = {}
         self._probe_failures: dict[str, str] = {}
 
-    async def _version_for_diagnostics(self, pending_failure: str) -> str:
-        """失败后探测 CLI 版本，后续复用结果。"""
-        if self._cli_version is None:
-            try:
-                result = await ProcessRunner.run_process(
-                    self.emulator_path, "version", timeout=1, if_merge_std=True
-                )
-            except asyncio.CancelledError as error:
-                if not error.args:
-                    error.args = (pending_failure,)
-                raise
-            except Exception:
-                # 可选探测也会经过宿主的分身进程，失败不能盖掉原命令的结果。
-                self._cli_version = "unknown"
-            else:
-                match = re.search(
-                    r'"version"\s*:\s*"([0-9]{1,6}(?:\.[0-9]{1,6}){1,4})"',
-                    result.stdout,
-                )
-                self._cli_version = (
-                    match[1] if result.returncode == 0 and match else "unknown"
-                )
-        return self._cli_version
+    async def probe_cli_version(self) -> None:
+        """为后续诊断缓存版本，探测从设备操作的等待链独立运行。"""
+        try:
+            result = await ProcessRunner.run_process(
+                self.emulator_path,
+                "version",
+                timeout=1,
+                deadline=time.monotonic() + 1,
+                if_merge_std=True,
+            )
+        except Exception:
+            return
+
+        if result.returncode == 0:
+            match = re.search(
+                r'"version"\s*:\s*"([0-9]{1,6}(?:\.[0-9]{1,6}){1,4})"',
+                result.stdout,
+            )
+            if match:
+                self._cli_version = match[1]
 
     async def _run_cli(
         self, stage: str, *args: str, breakaway: bool = False, context: str = ""
@@ -173,7 +170,7 @@ class MumuManager(DeviceBase):
             if not error.args:
                 detail = operation_detail(
                     stage,
-                    self._cli_version or "unknown",
+                    self._cli_version,
                     time.monotonic() - started_at,
                     timeout,
                 )
@@ -182,7 +179,7 @@ class MumuManager(DeviceBase):
         except TimeoutError:
             detail = operation_detail(
                 stage,
-                self._cli_version or "unknown",
+                self._cli_version,
                 time.monotonic() - started_at,
                 timeout,
             )
@@ -190,7 +187,7 @@ class MumuManager(DeviceBase):
         except OSError as error:
             detail = operation_detail(
                 stage,
-                self._cli_version or "unknown",
+                self._cli_version,
                 time.monotonic() - started_at,
                 timeout,
             )
@@ -206,12 +203,7 @@ class MumuManager(DeviceBase):
             f"returncode={result.returncode}, errcode={code}, "
             f"output={'present' if result.stdout.strip() else 'empty'}{context}"
         )
-        version = self._cli_version or "unknown"
-        if stage != "read-info":
-            version = await self._version_for_diagnostics(
-                f"MuMu 命令执行失败（stage={stage}, {failure}）"
-            )
-        detail = operation_detail(stage, version, elapsed, timeout)
+        detail = operation_detail(stage, self._cli_version, elapsed, timeout)
         hint = (
             _low_integrity_hint(self.emulator_path, result.stdout)
             if stage == "launch"
@@ -220,7 +212,7 @@ class MumuManager(DeviceBase):
         logger.debug(f"MuMu CLI {stage}: {result.failure_detail()}")
         raise MuMuCommandError(f"MuMu 命令执行失败（{detail}, {failure}）{hint}")
 
-    async def _state_failure(
+    def _state_failure(
         self,
         idx: str,
         stage: str,
@@ -231,10 +223,9 @@ class MumuManager(DeviceBase):
         elapsed = time.monotonic() - started_at
         probe = self._probe_failures.get(idx, "ok")
         failure = f"status={status.name}, probe={probe}"
-        version = await self._version_for_diagnostics(
-            f"MuMu 状态检查失败（stage={stage}, {failure}）"
+        detail = operation_detail(
+            stage, self._cli_version, elapsed, self.config.Info.MaxWaitTime
         )
-        detail = operation_detail(stage, version, elapsed, self.config.Info.MaxWaitTime)
         return MuMuCommandError(f"MuMu 状态检查失败（{detail}, {failure}）{diagnosis}")
 
     def get_adb_path(self) -> Path | None:
@@ -588,7 +579,7 @@ class MumuManager(DeviceBase):
                 f"当前状态: {status} - 用时: "
                 f"{time.monotonic() - started_at:.3f}秒"
             )
-            raise await self._state_failure(idx, "pre-launch", status, started_at)
+            raise self._state_failure(idx, "pre-launch", status, started_at)
 
         # 启动前强力清理要放在检查多开器窗口之前：清理会把多开器一起关掉，
         # 之后按「启动前没开多开器」的口径处理启动过程中弹出的窗口
@@ -681,9 +672,7 @@ class MumuManager(DeviceBase):
                 f"启动命令返回 0 后已等待 "
                 f"{time.monotonic() - online_started_at:.3f}秒仍未上线"
             )
-            raise await self._state_failure(
-                idx, "wait-online", status, started_at, diagnosis
-            )
+            raise self._state_failure(idx, "wait-online", status, started_at, diagnosis)
 
     async def _describe_launch_failure(self, idx: str) -> str:
         """启动失败 / 超时报错的附加说明。旧配置不加，Emulator 2.0 的后端覆盖它。"""
@@ -722,7 +711,7 @@ class MumuManager(DeviceBase):
         try:
             status = await self.getStatus(idx)
             if status in (DeviceStatus.ERROR, DeviceStatus.UNKNOWN):
-                raise await self._state_failure(idx, "pre-shutdown", status, started_at)
+                raise self._state_failure(idx, "pre-shutdown", status, started_at)
             if status not in (DeviceStatus.ONLINE, DeviceStatus.STARTING):
                 self.shutdown_reports[idx] = ShutdownReport(
                     status.name.lower(), time.monotonic()
@@ -761,7 +750,7 @@ class MumuManager(DeviceBase):
                     "offline-at-deadline", time.monotonic()
                 )
                 return DeviceStatus.OFFLINE
-            raise await self._state_failure(idx, "wait-offline", status, started_at)
+            raise self._state_failure(idx, "wait-offline", status, started_at)
         finally:
             if self.config.Info.ForceKillOnClose:
                 await run_in_worker(self._force_kill_mumu_processes)
@@ -982,6 +971,11 @@ class MumuManager(DeviceBase):
             except (MuMuCommandError, TimeoutError) as error:
                 self._probe_failures[idx] = str(error)
                 return DeviceStatus.ERROR
+            except Exception as error:
+                # 分身执行器或宿主进程读取失败时，启动仍能继续轮询。
+                self._probe_failures[idx] = type(error).__name__
+                logger.debug(f"MuMu 状态查询失败: {error}")
+                return DeviceStatus.ERROR
         try:
             data_json = self._decode_polluted_json(data, self._has_device_entries)
         except json.JSONDecodeError:
@@ -1124,7 +1118,7 @@ class MumuManager(DeviceBase):
             status in (DeviceStatus.ERROR, DeviceStatus.UNKNOWN)
             and require_known_status
         ):
-            raise await self._state_failure(idx, stage, status, started_at)
+            raise self._state_failure(idx, stage, status, started_at)
         if status not in (DeviceStatus.STARTING, DeviceStatus.ONLINE):
             logger.info(f"MuMu 窗口操作跳过（stage={stage}, status={status.name}）")
             return status
@@ -1143,7 +1137,7 @@ class MumuManager(DeviceBase):
             status in (DeviceStatus.ERROR, DeviceStatus.UNKNOWN)
             and require_known_status
         ):
-            raise await self._state_failure(idx, f"{stage}-verify", status, started_at)
+            raise self._state_failure(idx, f"{stage}-verify", status, started_at)
         return status
 
     async def get_device_info(self, idx: str) -> str:
