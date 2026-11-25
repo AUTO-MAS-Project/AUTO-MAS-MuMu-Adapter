@@ -191,7 +191,7 @@ def test_timeout_during_version_probe_preserves_known_failure(tmp_path, monkeypa
 
         monkeypatch.setattr(ProcessRunner, "run_process", run_process)
         pending = asyncio.create_task(backend._run("setting", "-v", "1", "-aw"))
-        await entered_version_probe.wait()
+        await asyncio.wait_for(entered_version_probe.wait(), timeout=2)
         await asyncio.wait_for(pending, timeout=0)
 
     with pytest.raises(TimeoutError) as error:
