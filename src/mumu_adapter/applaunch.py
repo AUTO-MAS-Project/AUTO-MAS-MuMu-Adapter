@@ -153,7 +153,18 @@ class AppLaunchResult:
     """走到哪一步结束的。"""
 
     detail: str = ""
-    """给日志看的补充信息, 通常是最后一条 adb 命令的输出。"""
+    """本地排查用的信息，可能含原始 ADB 输出。"""
+    diagnostics: str = ""
+    """可随异常上报的摘要。"""
+
+
+@dataclass
+class AdbReconnectReport:
+    attempts: int = 0
+    last_retry: str = "not-attempted"
+
+    def detail(self) -> str:
+        return f"reconnects={self.attempts}, retry={self.last_retry}"
 
 
 # ---- 纯解析 ---------------------------------------------------------------
@@ -229,6 +240,38 @@ def describe_adb_failure(output: str) -> str:
     )
 
 
+_INSTALL_ERROR_CODES = frozenset(
+    {
+        "INSTALL_FAILED_ALREADY_EXISTS",
+        "INSTALL_FAILED_INSUFFICIENT_STORAGE",
+        "INSTALL_FAILED_INVALID_APK",
+        "INSTALL_FAILED_NO_MATCHING_ABIS",
+        "INSTALL_FAILED_OLDER_SDK",
+        "INSTALL_FAILED_UPDATE_INCOMPATIBLE",
+        "INSTALL_FAILED_USER_RESTRICTED",
+        "INSTALL_FAILED_VERSION_DOWNGRADE",
+        "INSTALL_PARSE_FAILED_NO_CERTIFICATES",
+    }
+)
+
+
+def adb_output_kind(code: int, output: str) -> str:
+    """从 ADB 输出提取失败类别，保留已定义的 APK 安装错误码。"""
+    if not output.strip():
+        return "empty"
+    if is_stale_connection(output):
+        return "connection-lost"
+    output_lower = output.lower()
+    match = re.search(r"\bFailure \[(INSTALL_[A-Z_]{1,64})(?=[:\]])", output)
+    if match and match[1] in _INSTALL_ERROR_CODES:
+        return match[1]
+    if "unauthorized" in output_lower:
+        return "unauthorized"
+    if "[winerror 2]" in output_lower:
+        return "adb-not-found"
+    return "output-present" if code == 0 else "adb-error"
+
+
 def is_process_running(pidof_output: str) -> bool:
     """从 ``pidof <包名>`` 的输出里判断这个包的主进程是否活着。
 
@@ -255,7 +298,12 @@ def parse_launch_component(resolve_output: str, package_name: str) -> str | None
 # ---- adb 执行器 -----------------------------------------------------------
 
 
-def build_adb_runner(adb_path: Path | None, adb_address: str) -> AdbRunner:
+def build_adb_runner(
+    adb_path: Path | None,
+    adb_address: str,
+    *,
+    report: AdbReconnectReport | None = None,
+) -> AdbRunner:
     """把「哪个 adb、哪台设备」包成一个只接命令参数的执行器。
 
     ``adb_path`` 为 ``None`` 时回退系统 ``adb``, 与 :meth:`DeviceBase.get_adb_path`
@@ -287,6 +335,8 @@ def build_adb_runner(adb_path: Path | None, adb_address: str) -> AdbRunner:
             if now - last_reconnect < _RECONNECT_COOLDOWN:
                 return
             last_reconnect = now
+            if report is not None:
+                report.attempts += 1
             with suppress(Exception):
                 await ProcessRunner.run_process(
                     program,
@@ -321,12 +371,26 @@ def build_adb_runner(adb_path: Path | None, adb_address: str) -> AdbRunner:
                 # 而这里是每秒轮询, 全记会把日志刷满
                 if not failed_once:
                     failed_once = True
-                    logger.warning(f"adb 命令执行失败，期间不再重复记录: {e}")
+                    logger.warning(
+                        f"adb 命令执行失败，期间不再重复记录（{type(e).__name__}）"
+                    )
+                if retried and report is not None:
+                    report.last_retry = (
+                        type(e).__name__
+                        if isinstance(e, (OSError, TimeoutError))
+                        else "failed"
+                    )
                 return -1, str(e)
             if not retried and is_stale_connection(result.stdout):
                 # 连接已失效: 重建一次再试; 还是不行就把这次的输出原样交给上层
                 await reconnect()
                 continue
+            if retried and report is not None:
+                report.last_retry = (
+                    "ok"
+                    if result.returncode == 0 and not is_stale_connection(result.stdout)
+                    else adb_output_kind(result.returncode, result.stdout)
+                )
             return result.returncode, result.stdout.strip()
         return -1, ""
 
@@ -338,8 +402,8 @@ def build_adb_runner(adb_path: Path | None, adb_address: str) -> AdbRunner:
 
 async def _wait_boot_completed(
     run_adb: AdbRunner, deadline: float, poll_seconds: float
-) -> tuple[bool, str]:
-    """等 Android 起完, 返回 (是否起完, 最后一次 adb 的「返回码 输出」)。
+) -> tuple[bool, int, str]:
+    """等 Android 起完, 返回 (是否起完, 最后一次 adb 的返回码, 输出)。
 
     模拟器进程在线不等于系统可用: 各家原生 ``launch`` 一返回就报在线, 此时 adb 常常
     还连不上。这里等 ``sys.boot_completed`` 变成 ``1``, 顺带把「adb 通了没」一起等了。
@@ -351,23 +415,23 @@ async def _wait_boot_completed(
     while True:
         code, output = await run_adb("shell", "getprop", "sys.boot_completed")
         if code == 0 and output.strip() == "1":
-            return True, f"{code} {output.strip()}"
+            return True, code, output.strip()
         if time.monotonic() >= deadline:
-            return False, f"{code} {output.strip()}"
+            return False, code, output.strip()
         await asyncio.sleep(poll_seconds)
 
 
 async def _wait_foreground(
     run_adb: AdbRunner, package_name: str, deadline: float, poll_seconds: float
-) -> tuple[bool, str]:
-    """轮询到应用出现在前台为止, 返回 (是否到前台, 最后一次输出)。"""
+) -> tuple[bool, int, str]:
+    """轮询到应用出现在前台为止, 返回 (是否到前台, 最后一次返回码, 输出)。"""
     output = ""
     while True:
         code, output = await run_adb("shell", "dumpsys", "activity", "activities")
         if code == 0 and is_package_foreground(output, package_name):
-            return True, output
+            return True, code, output
         if time.monotonic() >= deadline:
-            return False, output
+            return False, code, output
         await asyncio.sleep(poll_seconds)
 
 
@@ -419,16 +483,25 @@ async def ensure_app_running(
     """
     prefix = f"设备 #{label} " if label else ""
 
-    booted, boot_detail = await _wait_boot_completed(
+    booted, boot_code, boot_output = await _wait_boot_completed(
         run_adb, time.monotonic() + boot_timeout, poll_seconds
     )
     if not booted:
-        hint = failure_hint(boot_detail) if failure_hint is not None else ""
-        logger.warning(
-            f"{prefix}等待系统启动完成超时，跳过启动 {package_name}"
-            f"（最后一次 adb 返回: {boot_detail}）{hint}"
+        hint = failure_hint(boot_output) if failure_hint is not None else ""
+        reason = (
+            "android-not-ready"
+            if boot_code == 0 and not is_stale_connection(boot_output)
+            else adb_output_kind(boot_code, boot_output)
         )
-        return AppLaunchResult(False, "boot-timeout", f"{boot_detail}{hint}")
+        boot_detail = f"{boot_code} {boot_output}"
+        logger.debug(f"等待系统启动完成超时，最后一次 ADB 返回: {boot_detail}")
+        logger.warning(f"{prefix}等待系统启动完成超时（{reason}）")
+        return AppLaunchResult(
+            False,
+            "boot-timeout",
+            f"{boot_detail}{hint}",
+            f"adb={reason}, returncode={boot_code}, timeout={boot_timeout:g}s",
+        )
 
     # 没装就别白试一轮 monkey 再等一轮前台，直接给出能照做的结论。
     # 判据见 is_package_missing：只认「输出为空」，返回码分不开没装和掉线。
@@ -476,9 +549,9 @@ async def ensure_app_running(
         f"{'' if component else '（解析不出启动组件，跳过 am start）'}"
     )
     # 一起发再统一等：三条都是同一个 LAUNCHER 意图，Android 会归并成一个任务
-    await asyncio.gather(*attempts, return_exceptions=True)
+    launch_results = await asyncio.gather(*attempts, return_exceptions=True)
 
-    arrived, detail = await _wait_foreground(
+    arrived, foreground_code, detail = await _wait_foreground(
         run_adb, package_name, time.monotonic() + launch_timeout, poll_seconds
     )
     if arrived:
@@ -489,7 +562,30 @@ async def ensure_app_running(
         return AppLaunchResult(True, "launched")
 
     logger.warning(f"{prefix}启动 {package_name} 超时，应用未进入前台")
-    return AppLaunchResult(False, "launch-timeout", detail)
+    methods = ["monkey"]
+    if vendor_launch is not None:
+        methods.append("vendor")
+    if component is not None:
+        methods.append("am-start")
+    outcomes = []
+    for method, result in zip(methods, launch_results, strict=True):
+        if isinstance(result, tuple):
+            code = result[0]
+        else:
+            code = getattr(result, "returncode", None)
+        outcomes.append(f"{method}={code if isinstance(code, int) else 'failed'}")
+    foreground_reason = (
+        "not-in-foreground"
+        if foreground_code == 0 and not is_stale_connection(detail)
+        else adb_output_kind(foreground_code, detail)
+    )
+    return AppLaunchResult(
+        False,
+        "launch-timeout",
+        detail,
+        f"adb={foreground_reason}, returncode={foreground_code}, timeout={launch_timeout:g}s, "
+        f"{', '.join(outcomes)}",
+    )
 
 
 # ---- 后端接线 -------------------------------------------------------------
@@ -560,8 +656,8 @@ class AppLaunchMixin(DeviceBase):
             result = await self.launch_app(idx, package_name, info)
             if result.reason == "boot-timeout":
                 raise RuntimeError(
-                    f"实例 {idx} 已在线，但等待安卓系统启动完成超时"
-                    f"（ADB {info.adb_address}）: {result.detail}"
+                    f"MuMu 实例已在线，但等待安卓系统启动完成超时（{result.diagnostics}）"
+                    f"{describe_adb_failure(result.detail)}"
                 )
             # 复制一份再填：后端可能把同一个 DeviceInfo 留作缓存
             info = replace(info, app_launch=result.reason)
@@ -601,8 +697,9 @@ class AppLaunchMixin(DeviceBase):
         max_wait = float(self.config.Info.MaxWaitTime)
         if launch_timeout is None:
             launch_timeout = min(max_wait, _LAUNCH_TIMEOUT_CAP)
-        return await ensure_app_running(
-            build_adb_runner(self.get_adb_path(), info.adb_address),
+        reconnect = AdbReconnectReport()
+        result = await ensure_app_running(
+            build_adb_runner(self.get_adb_path(), info.adb_address, report=reconnect),
             package_name,
             boot_timeout=min(max_wait, _BOOT_TIMEOUT_CAP),
             launch_timeout=launch_timeout,
@@ -610,6 +707,14 @@ class AppLaunchMixin(DeviceBase):
             label=str(idx),
             failure_hint=describe_adb_failure,
         )
+        if not result.ok or reconnect.attempts:
+            logger.info(f"MuMu 应用启动结果: {result.reason}, {reconnect.detail()}")
+        if not result.ok:
+            diagnostics = ", ".join(
+                filter(None, (result.diagnostics, reconnect.detail()))
+            )
+            return replace(result, diagnostics=diagnostics)
+        return result
 
     async def open_store(self, idx: str) -> AppLaunchResult:
         """打开这家模拟器自带的游戏中心 / 应用商店。

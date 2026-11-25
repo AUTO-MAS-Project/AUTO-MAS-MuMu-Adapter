@@ -4,7 +4,9 @@ import os
 import re
 from pathlib import Path
 
-from auto_mas_core.utils import IS_WINDOWS, registry
+from auto_mas_core.utils import IS_WINDOWS, get_logger, registry
+
+logger = get_logger("MuMu 安装发现")
 
 _KEYWORDS = (
     "MuMu Player",
@@ -130,10 +132,17 @@ def search_installations() -> list[str]:
     if not IS_WINDOWS:
         return []
     found: dict[str, str] = {}
+    unresolved = 0
     for name, command in registry.uninstall_entries(_UNINSTALL_ROOTS):
         if not any(keyword.casefold() in name.casefold() for keyword in _KEYWORDS):
             continue
         candidate = _extract_path_from_command(command)
         if candidate and (path := resolve_installation(candidate)):
             found.setdefault(os.path.normcase(str(Path(path).resolve())), path)
+        else:
+            unresolved += 1
+    if unresolved:
+        logger.info(
+            f"MuMu 安装发现结果: 已定位 {len(found)} 个，未定位管理程序 {unresolved} 个"
+        )
     return list(found.values())
