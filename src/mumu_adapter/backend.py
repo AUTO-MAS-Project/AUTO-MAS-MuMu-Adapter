@@ -75,7 +75,6 @@ logger = get_logger("Emulator2 MuMu管理")
 #: ``MuMuManager info`` 里值得带给用户的启动诊断字段，按这个顺序展示。
 _LAUNCH_DIAGNOSIS_FIELDS = (
     ("launch_err_code", "启动错误码"),
-    ("launch_err_msg", "启动错误"),
     ("error_code", "实例错误码"),
     ("player_state", "实例状态"),
 )
@@ -89,7 +88,10 @@ def format_launch_diagnosis(entry: dict[str, object]) -> str:
     parts = []
     for key, label in _LAUNCH_DIAGNOSIS_FIELDS:
         value = entry.get(key)
-        if value in (None, "", 0, False):
+        if key == "player_state":
+            if value not in ("start_finished", "starting", "stopping", "stopped"):
+                continue
+        elif not isinstance(value, int) or not value:
             continue
         parts.append(f"{label}={value}")
     if not parts:
@@ -345,14 +347,10 @@ class MuMu6Manager(AppLaunchMixin, MumuManager):
             logger.warning(f"重启 MuMu 实例 {idx} 的桌面失败: {result.stdout.strip()}")
 
     async def _run(self, *args: str) -> str:
-        result = await ProcessRunner.run_process(
-            self.emulator_path,
-            *args,
-            timeout=self.config.Info.MaxWaitTime,
-            if_merge_std=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.failure_detail())
+        stage = args[0]
+        if stage == "setting":
+            stage = "write-settings" if "-val" in args else "read-settings"
+        result = await self._run_cli(stage, *args)
         return result.stdout
 
     async def _setting_get(self, idx: str, keys: list[str]) -> dict[str, str]:

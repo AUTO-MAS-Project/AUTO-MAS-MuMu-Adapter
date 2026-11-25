@@ -7,9 +7,10 @@ import hashlib
 import json
 import os
 import tempfile
+import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Literal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from auto_mas_core import LockTicket, config_manager
@@ -25,7 +26,7 @@ from auto_mas_core.devices import (
 )
 from auto_mas_core.utils import file_lock, get_logger
 
-from .applaunch import build_adb_runner
+from .applaunch import AdbReconnectReport, adb_output_kind, build_adb_runner
 from .backend import MuMu6Manager
 from .config import MuMuDevice, MuMuGame
 from .discovery import search_installations
@@ -44,6 +45,7 @@ KEYS = {
 }
 
 logger = get_logger("MuMu 模拟器适配")
+RestorePhase = Literal["startup", "before-task", "after-task"]
 
 
 class Control(EmulatorControl[MuMuGame, MuMuDevice]):
@@ -176,22 +178,42 @@ class Control(EmulatorControl[MuMuGame, MuMuDevice]):
             raise RuntimeError("无法读取 MuMu 原始设置")
         return data
 
-    async def _restore(self, uid, backup):
+    async def _retry_restore(self, uid: UUID, *, phase: RestorePhase) -> None:
+        device = self.config.devices[uid]
+        backup = device.session.backup
+        if not backup:
+            return
+
         backend = await self.backend()
+        index = device.info.index
+        shutdown = backend.shutdown_reports.pop(index, None)
+        context = (
+            f", phase={phase}, fields={len(backup)}, "
+            f"empty={sum(value == '' or value is None for value in backup.values())}, "
+            f"non_string={sum(not isinstance(value, str) for value in backup.values())}"
+        )
+        if phase == "after-task" and shutdown is not None:
+            context += (
+                f", shutdown={shutdown.outcome}, "
+                f"since_offline={time.monotonic() - shutdown.observed_at:.2f}s"
+            )
         with tempfile.TemporaryDirectory(prefix="auto-mas-mumu-") as directory:
             path = Path(directory) / "restore.json"
             path.write_text(json.dumps(backup, ensure_ascii=False), encoding="utf-8")
-            await backend._run(
-                "setting", "-v", self.config.devices[uid].info.index, "-p", str(path)
+            await backend._run_cli(
+                "restore-settings",
+                "setting",
+                "-v",
+                index,
+                "-p",
+                str(path),
+                context=context,
             )
 
-    async def _retry_restore(self, uid: UUID) -> None:
-        device = self.config.devices[uid]
-        if device.session.backup:
-            await self._restore(uid, device.session.backup)
-            device.session.backup = {}
-            await device.commit()
-            await config_manager.flush()
+        device.session.backup = {}
+        await device.commit()
+        await config_manager.flush()
+        logger.info(f"MuMu 配置已恢复（{phase}）")
 
     async def _on_device_subscribed(
         self, device_uid: UUID, expect: object | None
@@ -201,8 +223,10 @@ class Control(EmulatorControl[MuMuGame, MuMuDevice]):
         await self._acquire_resource(device_uid)
         async with self.operation_scope(self._operation):
             device = self.device(device_uid)
+            backend = await self.backend()
+            backend.shutdown_reports.pop(device.info.index, None)
             try:
-                await self._retry_restore(device_uid)
+                await self._retry_restore(device_uid, phase="before-task")
             except Exception as error:
                 logger.warning(f"上次配置仍未恢复，保留备份并继续本轮任务：{error}")
             await self._ensure(device_uid)
@@ -213,12 +237,14 @@ class Control(EmulatorControl[MuMuGame, MuMuDevice]):
                     await config_manager.flush()
                 await self.apply_expect(device_uid, expect)
 
-    async def _on_device_unsubscribed(self, device_uid: UUID) -> None:
+    async def _on_device_unsubscribed(
+        self, device_uid: UUID, *, phase: RestorePhase = "after-task"
+    ) -> None:
         if device_uid not in self._resources:
             return
         try:
             async with self.operation_scope(self._operation):
-                await self._retry_restore(device_uid)
+                await self._retry_restore(device_uid, phase=phase)
         finally:
             handle = self._resources.pop(device_uid, None)
             if handle is not None:
@@ -356,14 +382,16 @@ class Control(EmulatorControl[MuMuGame, MuMuDevice]):
         backend = await self.backend()
         result = await backend.launch_app(self.device(device_uid).info.index, package)
         if not result.ok:
-            raise RuntimeError(f"应用启动失败：{result.reason}: {result.detail}")
+            raise RuntimeError(f"应用启动失败：{result.reason} {result.diagnostics}")
 
     async def open_store(self, device_uid: UUID, *, ticket: LockTicket) -> None:
         self.check_subscription(device_uid, ticket)
         backend = await self.backend()
         result = await backend.open_store(self.device(device_uid).info.index)
         if not result.ok:
-            raise RuntimeError(f"应用商店启动失败：{result.reason}: {result.detail}")
+            raise RuntimeError(
+                f"应用商店启动失败：{result.reason} {result.diagnostics}"
+            )
 
     async def create_instance(self, name: str | None = None) -> UUID:
         async with self.operation_scope(self._operation):
@@ -394,12 +422,19 @@ class Control(EmulatorControl[MuMuGame, MuMuDevice]):
         info = await self.device_info(device_uid)
         if not info.adb_address:
             raise RuntimeError("模拟器尚未提供 ADB 地址")
-        run = build_adb_runner(backend.get_adb_path(), info.adb_address)
+        reconnect = AdbReconnectReport()
+        run = build_adb_runner(
+            backend.get_adb_path(), info.adb_address, report=reconnect
+        )
         code, output = await run(
             "install", "-r", str(path), timeout=self.config.info.max_wait_time
         )
         if code != 0 or "Success" not in output:
-            raise RuntimeError(f"安装应用失败：{output}")
+            logger.debug(f"MuMu 安装 APK 失败: {output}")
+            raise RuntimeError(
+                f"MuMu 安装 APK 失败（returncode={code}, reason={adb_output_kind(code, output)}, "
+                f"{reconnect.detail()}）"
+            )
 
     async def device_info(self, uid: UUID) -> DeviceInfo:
         backend = await self.backend()
@@ -479,7 +514,7 @@ class Control(EmulatorControl[MuMuGame, MuMuDevice]):
                 except DeviceSubscribeError:
                     continue
                 try:
-                    await self._on_device_unsubscribed(device.uid)
+                    await self._on_device_unsubscribed(device.uid, phase="startup")
                 except Exception as error:
                     logger.warning(f"启动恢复失败，留待下次尝试：{error}")
 
