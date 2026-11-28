@@ -106,6 +106,17 @@ _STALE_CONNECTION_PATTERNS = (
     re.compile(r"no devices"),
 )
 
+#: adb 输出里表示「adb server 自己都没起来」的几种写法。这跟「连接过期」是两件事:
+#: server 不在的时候每条命令都会失败, 重连也一样要经过 server, 只会白试一轮。
+#: 实测 1999 那套 MuMu 的 ``adb.exe`` 被打上低完整性标签后写不了 ``%TEMP%\adb.log``,
+#: server 就是这样起不来的, 输出里既有一句 ``cannot open ...adb.log: Permission denied``,
+#: 也有 ``could not read ok from ADB Server`` / ``failed to start daemon``。
+_ADB_SERVER_PATTERNS = (
+    re.compile(r"could not read ok from adb server"),
+    re.compile(r"failed to start daemon"),
+    re.compile(r"cannot connect to daemon"),
+)
+
 #: 两次重连之间的最小间隔。等开机是每秒轮询, 不加限制会把 disconnect/connect 刷成
 #: 每秒一轮, 反而搅乱同一台机器上其它实例的连接。
 _RECONNECT_COOLDOWN = 5.0
@@ -214,13 +225,27 @@ def is_package_present(pm_path_output: str) -> bool:
     )
 
 
+def adb_server_failed(output: str) -> bool:
+    """从 adb 输出判断 adb server 本身是不是没起来。
+
+    这时问题不在某条连接过期: ``disconnect``/``connect`` 同样要连上 server, server 不在
+    就只会再报一遍同样的错, 重连等于白试一轮。
+    """
+    text = (output or "").lower()
+    return any(pattern.search(text) for pattern in _ADB_SERVER_PATTERNS)
+
+
 def is_stale_connection(output: str) -> bool:
     """从 adb 输出判断这条连接是否已经不可用（要重连, 而不是继续等）。
 
     ``device offline`` 和 ``device '...' not found`` 都不代表安卓没起来: 前者是 server
     里留着的旧连接, 后者是地址对不上。两种都只能靠重新 ``connect`` 恢复,
     靠「再多等几秒」永远等不到。
+
+    server 自己没能启动时返回 ``False``: 那连「重连」都做不到, 得先看 adb 为什么起不来。
     """
+    if adb_server_failed(output):
+        return False
     text = (output or "").lower()
     return any(pattern.search(text) for pattern in _STALE_CONNECTION_PATTERNS)
 
@@ -231,7 +256,16 @@ def describe_adb_failure(output: str) -> str:
     连接过期时重试多少次都没用: 同一台机器上两个模拟器各自带一个 adb, 后启动的会把
     5037 的 server 顶掉, 顶掉之后旧连接记录就成了僵尸——``connect`` 回成功, 每条命令
     却都报 offline。这不是「安卓起得慢」, 提示里直接说清该动什么。
+
+    adb server 自己没起来是另一回事, 提示指向 adb 本身而不是别的模拟器。
     """
+    if adb_server_failed(output):
+        return (
+            "。adb 自己没能启动（输出里有 could not read ok from ADB Server 或"
+            " failed to start daemon 一类报错）, 重连救不回来: 先看 adb.exe 能不能在临时"
+            "目录里写 adb.log——比如它所在目录被打了低完整性标签、或临时目录被安全软件"
+            "拦住, 再确认没有别的 adb 进程占着 5037 端口"
+        )
     if not is_stale_connection(output):
         return ""
     return (
@@ -736,12 +770,13 @@ __all__ = [
     "AppLaunchMixin",
     "AppLaunchResult",
     "LaunchReason",
+    "adb_server_failed",
     "build_adb_runner",
     "describe_adb_failure",
     "ensure_app_running",
     "is_package_foreground",
     "is_package_missing",
-    "is_stale_connection",
     "is_process_running",
+    "is_stale_connection",
     "parse_launch_component",
 ]

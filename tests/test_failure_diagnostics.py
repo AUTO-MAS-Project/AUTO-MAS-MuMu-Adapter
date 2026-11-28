@@ -226,3 +226,41 @@ def test_transient_desktop_transport_failure_allows_next_status_probe(
     monkeypatch.setattr(ProcessRunner, "run_process", run_process)
     assert asyncio.run(backend.getStatus("1")) == DeviceStatus.ERROR
     assert asyncio.run(backend.getStatus("1")) == DeviceStatus.OFFLINE
+
+
+#: adb server 自己起不来时的真实输出（1999 那套 MuMu 的 adb.exe 被打上低完整性标签后
+#: 写不了临时目录里的 adb.log, server 就一直起不来）。这不是「连接过期」, 重连救不回来。
+_DAEMON_FAILED_OUTPUT = (
+    "adb F 11-28 13:47:43 31824 5020 main.cpp:52] "
+    "cannot open D:\\aWa\\AUTO-MAS\\temp\\adb.log: Permission denied\n"
+    "could not read ok from ADB Server\n"
+    "* failed to start daemon\n"
+    "error: cannot connect to daemon"
+)
+
+
+@pytest.mark.parametrize(
+    "output",
+    (
+        _DAEMON_FAILED_OUTPUT,
+        "could not read ok from ADB Server",
+        "* failed to start daemon",
+        "error: cannot connect to daemon",
+    ),
+)
+def test_daemon_start_failure_is_not_a_stale_connection(output):
+    assert applaunch.adb_server_failed(output)
+    assert not applaunch.is_stale_connection(output)
+    assert applaunch.adb_output_kind(1, output) == "adb-error"
+
+
+def test_daemon_start_failure_hint_points_at_adb_itself():
+    hint = applaunch.describe_adb_failure(_DAEMON_FAILED_OUTPUT)
+    assert "adb 自己没能启动" in hint
+    assert "顶掉了" not in hint
+
+
+def test_stale_connection_keeps_the_other_emulator_hint():
+    hint = applaunch.describe_adb_failure("error: device offline")
+    assert "5037 的 server" in hint
+    assert "adb 自己没能启动" not in hint
